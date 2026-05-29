@@ -45,7 +45,7 @@ Validated locally:
 - runtime Claude settings generation so global Claude Code settings do not silently override the bridge endpoint;
 - `gpt-5.5` and `gpt-5.4` paths.
 
-See [docs/VALIDATION.md](docs/VALIDATION.md) for a concise validation summary.
+See [docs/VALIDATION.md](docs/VALIDATION.md) for a concise validation summary, and [docs/ISSUE_AND_FIX.md](docs/ISSUE_AND_FIX.md) for the concrete long-loop failure analysis and fix notes.
 
 ## Requirements
 
@@ -152,6 +152,7 @@ bin/                         wrapper and bridge scripts
 src/claude-gpt-bridge.mjs    bridge implementation
 prompts/                     injected GPT tool protocol prompt
 examples/                    MCP example
+docs/ISSUE_AND_FIX.md        concrete issue analysis and fix report
 docs/VALIDATION.md           validation summary
 test/bridge-unit.mjs         parser and conversion unit tests
 settingapi.example.md        private API config template
