@@ -1,0 +1,5 @@
+#!/bin/zsh
+set -euo pipefail
+
+"$(cd -- "$(dirname -- "$0")" && pwd)/claude-gpt-bridge" start >/dev/null
+printf '%s\n' 'local-gpt-bridge-token'

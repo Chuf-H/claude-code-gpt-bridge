@@ -1,0 +1,15 @@
+.bridge/
+.local/
+.env
+.env.*
+*.log
+*.pid
+*.ndjson
+*.jsonl
+settingapi.md
+settingapi.local.md
+tmp_agent_check/
+tmp_protocol_check/
+tmp_mcp_check/
+tmp_tool_stress/
+__pycache__/

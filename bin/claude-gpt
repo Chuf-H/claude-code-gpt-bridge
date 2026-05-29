@@ -1,0 +1,62 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT="${CLAUDE_GPT_BRIDGE_ROOT:-$(cd -- "$(dirname -- "$0")/.." && pwd)}"
+HOST="${CLAUDE_GPT_BRIDGE_HOST:-127.0.0.1}"
+PORT="${CLAUDE_GPT_BRIDGE_PORT:-8822}"
+LOG_FILE="$ROOT/.bridge/bridge.log"
+SCRIPT="$ROOT/src/claude-gpt-bridge.mjs"
+NODE_BIN="${NODE_BIN:-}"
+
+mkdir -p "$ROOT/.bridge"
+
+if [[ -z "$NODE_BIN" || ! -x "$NODE_BIN" ]]; then
+  for candidate in \
+    "$(command -v node 2>/dev/null || true)" \
+    "/Applications/Codex.app/Contents/Resources/node" \
+    "/opt/homebrew/bin/node" \
+    "/usr/local/bin/node" \
+    "/usr/bin/node"
+  do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      NODE_BIN="$candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$NODE_BIN" || ! -x "$NODE_BIN" ]]; then
+  echo "Node.js not found for claude-gpt" >&2
+  exit 1
+fi
+
+"$NODE_BIN" "$SCRIPT" >>"$LOG_FILE" 2>&1 &
+bridge_pid=$!
+
+cleanup() {
+  kill "$bridge_pid" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+for _ in {1..80}; do
+  if /usr/bin/curl -fsS "http://$HOST:$PORT/healthz" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+
+if ! /usr/bin/curl -fsS "http://$HOST:$PORT/healthz" >/dev/null 2>&1; then
+  echo "Bridge failed to start. See $LOG_FILE" >&2
+  exit 1
+fi
+
+export ANTHROPIC_BASE_URL="http://$HOST:$PORT"
+export ANTHROPIC_API_KEY="local-gpt-bridge-token"
+export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-gpt-5.5}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-gpt-5.5}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-gpt-5.5}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-gpt-5.4}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${CLAUDE_CODE_SUBAGENT_MODEL:-gpt-5.4}"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}"
+
+claude --settings "$ROOT/claude-gpt-settings.json" "$@"

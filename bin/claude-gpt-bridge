@@ -1,0 +1,82 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT="${CLAUDE_GPT_BRIDGE_ROOT:-$(cd -- "$(dirname -- "$0")/.." && pwd)}"
+HOST="${CLAUDE_GPT_BRIDGE_HOST:-127.0.0.1}"
+PORT="${CLAUDE_GPT_BRIDGE_PORT:-8822}"
+STATE_DIR="$ROOT/.bridge"
+PID_FILE="$STATE_DIR/bridge.pid"
+LOG_FILE="$STATE_DIR/bridge.log"
+SCRIPT="$ROOT/src/claude-gpt-bridge.mjs"
+NODE_BIN="${NODE_BIN:-}"
+
+mkdir -p "$STATE_DIR"
+
+if [[ -z "$NODE_BIN" || ! -x "$NODE_BIN" ]]; then
+  for candidate in \
+    "$(command -v node 2>/dev/null || true)" \
+    "/Applications/Codex.app/Contents/Resources/node" \
+    "/opt/homebrew/bin/node" \
+    "/usr/local/bin/node" \
+    "/usr/bin/node"
+  do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      NODE_BIN="$candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$NODE_BIN" || ! -x "$NODE_BIN" ]]; then
+  echo "Node.js not found for claude-gpt-bridge" >&2
+  exit 1
+fi
+
+is_healthy() {
+  /usr/bin/curl -fsS "http://$HOST:$PORT/healthz" >/dev/null 2>&1
+}
+
+case "${1:-start}" in
+  start)
+    if is_healthy; then
+      exit 0
+    fi
+    nohup "$NODE_BIN" "$SCRIPT" </dev/null >>"$LOG_FILE" 2>&1 &
+    pid=$!
+    disown "$pid" >/dev/null 2>&1 || true
+    echo "$pid" >"$PID_FILE"
+    for _ in {1..80}; do
+      if is_healthy; then
+        exit 0
+      fi
+      sleep 0.25
+    done
+    echo "Bridge failed to start. See $LOG_FILE" >&2
+    exit 1
+    ;;
+  stop)
+    if [[ -f "$PID_FILE" ]]; then
+      kill "$(cat "$PID_FILE")" >/dev/null 2>&1 || true
+      rm -f "$PID_FILE"
+    fi
+    ;;
+  restart)
+    "$0" stop || true
+    "$0" start
+    ;;
+  status)
+    if is_healthy; then
+      echo "running on http://$HOST:$PORT"
+    else
+      echo "stopped"
+      exit 1
+    fi
+    ;;
+  logs)
+    exec tail -n "${2:-120}" "$LOG_FILE"
+    ;;
+  *)
+    echo "Usage: claude-gpt-bridge {start|stop|restart|status|logs [lines]}" >&2
+    exit 1
+    ;;
+esac
