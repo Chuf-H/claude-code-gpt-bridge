@@ -59,4 +59,23 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-gpt-5.4}"
 export CLAUDE_CODE_SUBAGENT_MODEL="${CLAUDE_CODE_SUBAGENT_MODEL:-gpt-5.4}"
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}"
 
-claude --settings "$ROOT/claude-gpt-settings.json" "$@"
+RUNTIME_SETTINGS="$ROOT/.bridge/claude-gpt-settings.runtime.json"
+"$NODE_BIN" - "$ROOT/claude-gpt-settings.json" "$RUNTIME_SETTINGS" "$HOST" "$PORT" <<'NODE'
+const fs = require("node:fs");
+const [source, target, host, port] = process.argv.slice(2);
+const settings = JSON.parse(fs.readFileSync(source, "utf8"));
+settings.env = {
+  ...(settings.env || {}),
+  ANTHROPIC_BASE_URL: `http://${host}:${port}`,
+  ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL || "gpt-5.5",
+  ANTHROPIC_DEFAULT_OPUS_MODEL: process.env.ANTHROPIC_DEFAULT_OPUS_MODEL || "gpt-5.5",
+  ANTHROPIC_DEFAULT_SONNET_MODEL: process.env.ANTHROPIC_DEFAULT_SONNET_MODEL || "gpt-5.5",
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || "gpt-5.4",
+  CLAUDE_CODE_SUBAGENT_MODEL: process.env.CLAUDE_CODE_SUBAGENT_MODEL || "gpt-5.4",
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || "1",
+  ENABLE_TOOL_SEARCH: "false",
+};
+fs.writeFileSync(target, JSON.stringify(settings, null, 2) + "\n");
+NODE
+
+claude --settings "$RUNTIME_SETTINGS" "$@"

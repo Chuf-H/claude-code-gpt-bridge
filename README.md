@@ -40,6 +40,9 @@ Validated locally:
 - multi-turn `Bash / Read / Write / Edit` tool calls;
 - file creation, reading, editing, shell computation, and final verification;
 - MCP tool calls using names like `mcp__server__tool`;
+- a long-loop guardrail that retries once if the backend wrongly claims file or shell tools are unavailable while Claude Code has provided them;
+- tolerant parsing for common GPT variants such as `<tool_use ... />`, `<tool_use>{...}</tool_use>`, and a complete JSON tool call with a missing closing tag;
+- runtime Claude settings generation so global Claude Code settings do not silently override the bridge endpoint;
 - `gpt-5.5` and `gpt-5.4` paths.
 
 See [docs/VALIDATION.md](docs/VALIDATION.md) for a concise validation summary.

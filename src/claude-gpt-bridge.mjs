@@ -236,6 +236,7 @@ function flattenAnthropicMessages(systemBlocks = [], messages = [], tools = []) 
     }
   }
 
+  appendLatestToolReminder(result, tools);
   return result;
 }
 
@@ -264,10 +265,13 @@ function truncate(value, max) {
 function buildToolProtocolPrompt(tools = []) {
   const toolSummaries = tools.map(summarizeTool);
   const toolBlock = JSON.stringify(toolSummaries, null, 2);
+  const names = toolNames(tools);
   return [
     "## Claude Code GPT Tool Bridge",
     "",
     "You are the model backend for Claude Code. You do not have direct filesystem, shell, network, or editor access. When you need to inspect files, run commands, or edit files, you must request one of the host tools below. The bridge will convert your request into Claude Code tool_use blocks, Claude Code will execute the tool, and you will receive a <tool_result> message.",
+    "",
+    names.length ? `Available tool names now: ${names.join(", ")}` : "Available tool names now: none.",
     "",
     "Tool-call protocol:",
     "- If a tool is needed, output only one or more tool call tags and no explanatory prose.",
@@ -277,6 +281,7 @@ function buildToolProtocolPrompt(tools = []) {
     "- Do not wrap tool calls in Markdown fences. Do not invent tool results. After receiving tool results, continue with another tool call or a normal final answer.",
     "- For Bash, use the key \"command\" for the shell command and include a short \"description\" when possible.",
     "- For Read, Write, Edit, MultiEdit, Grep, Glob, and LS, use the exact field names shown in their schemas.",
+    "- If Bash, Read, Write, Edit, Grep, Glob, LS, or mcp__... tools are listed above, never claim that file, shell, filesystem, or MCP tools are unavailable. Request the tool instead.",
     "- If no tool is needed, answer normally without any <tool_call> tags.",
     "",
     "Available tools:",
@@ -284,6 +289,62 @@ function buildToolProtocolPrompt(tools = []) {
     toolBlock,
     "```",
   ].join("\n");
+}
+
+function toolNames(tools = []) {
+  return (tools || []).map((tool) => tool?.name).filter(Boolean);
+}
+
+function hasFileOrShellTools(tools = []) {
+  const names = new Set(toolNames(tools));
+  return ["Bash", "Read", "Write", "Edit", "MultiEdit", "Grep", "Glob", "LS"].some((name) => names.has(name));
+}
+
+function buildLatestToolReminder(tools = []) {
+  const names = toolNames(tools);
+  if (!names.length) {
+    return "";
+  }
+
+  const examples = [];
+  if (names.includes("Bash")) {
+    examples.push("<tool_call>{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\",\"description\":\"Print current directory\"}}</tool_call>");
+  }
+  if (names.includes("Read")) {
+    examples.push("<tool_call>{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/absolute/path/to/file\"}}</tool_call>");
+  }
+  const mcpName = names.find((name) => name.startsWith("mcp__"));
+  if (mcpName) {
+    examples.push(`<tool_call>{"name":"${mcpName}","arguments":{}}</tool_call>`);
+  }
+
+  return [
+    "<bridge_tool_reminder>",
+    `Host tools ARE AVAILABLE in this Claude Code session: ${names.join(", ")}.`,
+    "If the task requires files, shell commands, edits, search, or MCP, emit <tool_call>{...}</tool_call> rather than saying you lack tools.",
+    hasFileOrShellTools(tools) ? "Bash/Read/Write/Edit-style tools mean file and shell work is possible through the host. Do not claim otherwise." : "",
+    examples.length ? `Examples: ${examples.join(" ")}` : "",
+    "</bridge_tool_reminder>",
+  ].filter(Boolean).join("\n");
+}
+
+function appendLatestToolReminder(messages, tools = []) {
+  const reminder = buildLatestToolReminder(tools);
+  if (!reminder) {
+    return;
+  }
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      messages[index] = {
+        ...messages[index],
+        content: `${messages[index].content || ""}\n\n${reminder}`,
+      };
+      return;
+    }
+  }
+
+  messages.push({ role: "user", content: reminder });
 }
 
 function modelForRequest(model) {
@@ -348,14 +409,16 @@ async function callUpstreamChat(body, modelOverride = null) {
   }
 }
 
-async function callUpstreamWithFallback(body) {
-  const first = await callUpstreamChat(body);
+async function callUpstreamWithFallback(body, context = {}) {
+  const tools = context.tools || [];
+  const firstRaw = await callUpstreamChat(body);
+  const first = firstRaw.ok ? await retryToolDenialOnce(firstRaw, body, tools) : firstRaw;
   if (first.ok || body.model === FALLBACK_MODEL) {
     return first;
   }
-  const message = upstreamErrorMessage(first);
-  if (first.status === 400 && /model|unsupported|not supported|Instructions are required/i.test(message)) {
-    const fallback = await callUpstreamChat(body, FALLBACK_MODEL);
+  if (shouldFallbackToFallbackModel(first, body.model)) {
+    const fallbackRaw = await callUpstreamChat(body, FALLBACK_MODEL);
+    const fallback = fallbackRaw.ok ? await retryToolDenialOnce(fallbackRaw, body, tools, FALLBACK_MODEL) : fallbackRaw;
     if (fallback.ok) {
       return fallback;
     }
@@ -371,6 +434,124 @@ function upstreamErrorMessage(upstream) {
       upstream?.raw ||
       "",
   );
+}
+
+function shouldFallbackToFallbackModel(upstream, requestedModel) {
+  if (requestedModel === FALLBACK_MODEL) {
+    return false;
+  }
+  const message = upstreamErrorMessage(upstream);
+  if (upstream?.status === 400 && /model|unsupported|not supported|Instructions are required/i.test(message)) {
+    return true;
+  }
+  if ([502, 503, 504].includes(upstream?.status) && /model|provider|key|available|temporar|overload|server/i.test(message)) {
+    return true;
+  }
+  return false;
+}
+
+async function retryToolDenialOnce(upstream, body, tools = [], modelOverride = null) {
+  if (!shouldRetryToolDenial(upstream, tools)) {
+    return upstream;
+  }
+
+  const retryBody = withToolDenialCorrection(body, tools, upstream);
+  await trace("tool_denial_retry", {
+    model: modelOverride || body?.model,
+    available_tools: toolNames(tools),
+    denial_preview: truncate(openAIMessageText(upstreamAssistantMessage(upstream)), 500),
+  });
+  const retry = await callUpstreamChat(retryBody, modelOverride);
+  return retry.ok ? { ...retry, bridge_retry: "tool_denial" } : upstream;
+}
+
+function shouldRetryToolDenial(upstream, tools = []) {
+  if (!upstream?.ok || !hasFileOrShellTools(tools)) {
+    return false;
+  }
+
+  const message = upstreamAssistantMessage(upstream);
+  if (upstreamMessageHasToolCall(message, tools)) {
+    return false;
+  }
+  return isToolDenialText(openAIMessageText(message));
+}
+
+function upstreamAssistantMessage(upstream) {
+  return upstream?.payload?.choices?.[0]?.message || {};
+}
+
+function upstreamMessageHasToolCall(message = {}, tools = []) {
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
+    return true;
+  }
+  return extractToolCallsFromText(openAIMessageText(message), tools).length > 0;
+}
+
+function openAIMessageText(message = {}) {
+  if (typeof message.content === "string") {
+    return message.content;
+  }
+  if (Array.isArray(message.content)) {
+    return message.content
+      .map((part) => {
+        if (typeof part === "string") {
+          return part;
+        }
+        return part?.text || "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+function isToolDenialText(text) {
+  if (!text || typeof text !== "string") {
+    return false;
+  }
+  const normalized = text.replace(/\s+/g, " ");
+  const englishPatterns = [
+    /\b(?:no|without|lack|lacking|don't have|do not have|can't access|cannot access|unable to access|don't have access to|do not have access to)\b.{0,140}\b(?:file|files|filesystem|shell|bash|terminal|command|commands|tool|tools|mcp)\b/i,
+    /\b(?:file|files|filesystem|shell|bash|terminal|command|commands|tool|tools|mcp)\b.{0,140}\b(?:unavailable|not available|not accessible|can't access|cannot access|don't have|do not have|no access|lack|lacking)\b/i,
+  ];
+  const chinesePatterns = [
+    /没有.{0,50}(工具|文件|文件系统|shell|终端|命令|bash|mcp)/i,
+    /无法.{0,50}(访问|使用|调用).{0,50}(工具|文件|文件系统|shell|终端|命令|bash|mcp)/i,
+    /不能.{0,50}(访问|使用|调用).{0,50}(工具|文件|文件系统|shell|终端|命令|bash|mcp)/i,
+    /(工具|文件|文件系统|shell|终端|命令|bash|mcp).{0,50}(不可用|没有|无法访问|不能访问)/i,
+  ];
+  return [...englishPatterns, ...chinesePatterns].some((pattern) => pattern.test(normalized));
+}
+
+function withToolDenialCorrection(body, tools = [], upstream = {}) {
+  const priorText = openAIMessageText(upstreamAssistantMessage(upstream));
+  const messages = [...(body?.messages || [])];
+  if (priorText) {
+    messages.push({ role: "assistant", content: priorText });
+  }
+  messages.push({ role: "user", content: buildToolDenialCorrection(tools) });
+  return { ...body, messages };
+}
+
+function buildToolDenialCorrection(tools = []) {
+  const names = toolNames(tools);
+  const examples = [];
+  if (names.includes("Bash")) {
+    examples.push("<tool_call>{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\",\"description\":\"Check current directory\"}}</tool_call>");
+  }
+  if (names.includes("Read")) {
+    examples.push("<tool_call>{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/absolute/path/to/file\"}}</tool_call>");
+  }
+
+  return [
+    "<bridge_tool_correction>",
+    `The previous response incorrectly claimed that file, shell, or host tools were unavailable. They ARE available in this Claude Code session: ${names.join(", ")}.`,
+    "If the user task requires inspecting files, running shell commands, editing files, or calling MCP tools, emit the needed <tool_call>{...}</tool_call> now and no explanatory prose.",
+    "Do not say you lack file, shell, filesystem, terminal, command, or tool access while these tools are listed.",
+    examples.length ? `Use this exact protocol, for example: ${examples.join(" ")}` : "",
+    "</bridge_tool_correction>",
+  ].filter(Boolean).join("\n");
 }
 
 function parseJsonSafe(value) {
@@ -562,6 +743,54 @@ function extractTaggedToolCalls(text, toolMap) {
   return calls;
 }
 
+function extractLooseTaggedToolCalls(text, toolMap) {
+  const match = text.match(/<tool_call\b([^>]*)>([\s\S]*)$/i);
+  if (!match) {
+    return [];
+  }
+  const attrs = parseXmlAttrs(match[1] || "");
+  const body = (firstBalancedJson(match[2].trim()) || match[2].trim()).trim();
+  return normalizeToolCalls(body, attrs, toolMap);
+}
+
+function parseToolUseAttrs(attrText = "") {
+  const attrs = parseXmlAttrs(attrText);
+  const inputIndex = attrText.search(/\binput\s*=/i);
+  if (inputIndex >= 0) {
+    const rest = attrText.slice(inputIndex).replace(/^\s*input\s*=\s*/i, "").trim();
+    if (rest.startsWith("{") || rest.startsWith("[")) {
+      attrs.input = firstBalancedJson(rest);
+    } else {
+      const quoted = rest.match(/^"([^"]*)"|^'([^']*)'/);
+      if (quoted) {
+        attrs.input = quoted[1] ?? quoted[2] ?? "";
+      }
+    }
+  }
+  return attrs;
+}
+
+function extractAnthropicToolUseCalls(text, toolMap) {
+  const calls = [];
+  const tagRegexp = /<tool_use\b([^>]*?)(?:\/>|>([\s\S]*?)<\/tool_use>)/gi;
+  let match;
+  while ((match = tagRegexp.exec(text))) {
+    const attrs = parseToolUseAttrs(match[1] || "");
+    const body = (match[2] || "").trim();
+    if (!attrs.name && !attrs.tool && !attrs.input && body) {
+      calls.push(...normalizeToolCalls(body, attrs, toolMap));
+      continue;
+    }
+    const value = {
+      id: attrs.id,
+      name: attrs.name || attrs.tool,
+      input: attrs.input ? parseJsonSafe(attrs.input) : parseJsonSafe(body || {}),
+    };
+    calls.push(...normalizeToolCalls(value, attrs, toolMap));
+  }
+  return calls;
+}
+
 function extractJsonToolCalls(text, toolMap) {
   const cleaned = stripCodeFence(text.trim());
   if (!/^\s*[\[{]/.test(cleaned)) {
@@ -578,6 +807,14 @@ function extractToolCallsFromText(text, tools = []) {
   const tagged = extractTaggedToolCalls(text, toolMap);
   if (tagged.length) {
     return tagged;
+  }
+  const looseTagged = extractLooseTaggedToolCalls(text, toolMap);
+  if (looseTagged.length) {
+    return looseTagged;
+  }
+  const anthropicTagged = extractAnthropicToolUseCalls(text, toolMap);
+  if (anthropicTagged.length) {
+    return anthropicTagged;
   }
   return extractJsonToolCalls(text, toolMap);
 }
@@ -811,7 +1048,7 @@ function createServer() {
       const requestBody = await readJsonBody(req);
       await trace("anthropic_request", requestBody);
       const upstreamRequest = toOpenAIChatRequest(requestBody);
-      const upstream = await callUpstreamWithFallback(upstreamRequest);
+      const upstream = await callUpstreamWithFallback(upstreamRequest, { tools: requestBody.tools || [] });
 
       if (!upstream.ok) {
         json(res, upstream.status, mapUpstreamError(upstream.status, upstream.payload, upstream.raw));
@@ -848,7 +1085,11 @@ export {
   createServer,
   extractToolCallsFromText,
   flattenAnthropicMessages,
+  isToolDenialText,
   parseJsonSafe,
   repairToolInput,
+  shouldRetryToolDenial,
+  shouldFallbackToFallbackModel,
   toOpenAIChatRequest,
+  withToolDenialCorrection,
 };
