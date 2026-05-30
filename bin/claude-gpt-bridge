@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
 ROOT="${CLAUDE_GPT_BRIDGE_ROOT:-$(cd -- "$(dirname -- "$0")/.." && pwd)}"
@@ -59,6 +59,8 @@ case "${1:-start}" in
       kill "$(cat "$PID_FILE")" >/dev/null 2>&1 || true
       rm -f "$PID_FILE"
     fi
+    pkill -f "$NODE_BIN $SCRIPT" >/dev/null 2>&1 || true
+    pkill -f "$SCRIPT" >/dev/null 2>&1 || true
     ;;
   restart)
     "$0" stop || true

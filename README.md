@@ -154,6 +154,7 @@ prompts/                     injected GPT tool protocol prompt
 examples/                    MCP example
 docs/ISSUE_AND_FIX.md        concrete issue analysis and fix report
 docs/VALIDATION.md           validation summary
+report.md                    latest robustness report from long-loop validation
 test/bridge-unit.mjs         parser and conversion unit tests
 settingapi.example.md        private API config template
 ```

@@ -21,6 +21,9 @@ const SETTINGS_CANDIDATES = [
 const DEFAULT_MODEL = process.env.CLAUDE_GPT_MODEL || "gpt-5.5";
 const FALLBACK_MODEL = process.env.CLAUDE_GPT_FALLBACK_MODEL || "gpt-5.4";
 const UPSTREAM_TIMEOUT_MS = Number.parseInt(process.env.CLAUDE_GPT_TIMEOUT_MS || "180000", 10);
+const UPSTREAM_RETRIES = Number.parseInt(process.env.CLAUDE_GPT_UPSTREAM_RETRIES || "2", 10);
+const UPSTREAM_RETRY_BASE_MS = Number.parseInt(process.env.CLAUDE_GPT_UPSTREAM_RETRY_BASE_MS || "750", 10);
+const TOOL_COMPLIANCE_RETRIES = Math.max(1, Number.parseInt(process.env.CLAUDE_GPT_TOOL_COMPLIANCE_RETRIES || "3", 10));
 const TRACE = process.env.CLAUDE_GPT_BRIDGE_TRACE === "1";
 const TRACE_FILE = process.env.CLAUDE_GPT_TRACE_FILE || path.join(ROOT, ".bridge", "trace.ndjson");
 const PRIVATE_HOME_RE = new RegExp(`/${"Users"}/[^/\\s"]+`, "g");
@@ -376,49 +379,121 @@ function toOpenAIChatRequest(body) {
 async function callUpstreamChat(body, modelOverride = null) {
   const { apiKey, baseUrl } = await readUpstreamConfig();
   const payload = modelOverride ? { ...body, model: modelOverride } : body;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
-  try {
-    await trace("upstream_request", payload);
-    const response = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    const text = await response.text();
-    let parsed;
+  const attempts = Math.max(0, UPSTREAM_RETRIES) + 1;
+  let lastResult = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
     try {
-      parsed = JSON.parse(text);
-    } catch {
-      parsed = { raw: text };
+      await trace("upstream_request", { attempt, attempts, payload });
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = { raw: text };
+      }
+      const result = {
+        ok: response.ok,
+        status: response.status,
+        payload: parsed,
+        raw: text,
+        model: payload.model,
+        attempt,
+        attempts,
+      };
+      await trace("upstream_response", { status: response.status, ok: response.ok, attempt, attempts, payload: parsed });
+      lastResult = result;
+      if (!response.ok && attempt < attempts && isRetryableUpstreamStatus(response.status, parsed)) {
+        await trace("upstream_retry", { attempt, status: response.status, model: payload.model });
+        await sleep(retryDelayMs(attempt));
+        continue;
+      }
+      return result;
+    } catch (error) {
+      const result = upstreamFetchErrorResult(error, payload.model, attempt, attempts);
+      lastResult = result;
+      await trace("upstream_fetch_error", {
+        attempt,
+        attempts,
+        model: payload.model,
+        status: result.status,
+        message: result.payload.error.message,
+      });
+      if (attempt < attempts && isRetryableFetchError(error)) {
+        await sleep(retryDelayMs(attempt));
+        continue;
+      }
+      return result;
+    } finally {
+      clearTimeout(timeout);
     }
-    await trace("upstream_response", { status: response.status, ok: response.ok, payload: parsed });
-    return {
-      ok: response.ok,
-      status: response.status,
-      payload: parsed,
-      raw: text,
-      model: payload.model,
-    };
-  } finally {
-    clearTimeout(timeout);
   }
+
+  return lastResult || upstreamFetchErrorResult(new Error("upstream request failed before execution"), payload.model, attempts, attempts);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryDelayMs(attempt) {
+  return Math.min(5000, UPSTREAM_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
+}
+
+function isRetryableUpstreamStatus(status, payload = {}) {
+  if ([408, 409, 425, 429, 500, 502, 503, 504].includes(status)) {
+    return true;
+  }
+  const message = upstreamErrorMessage({ payload });
+  return /timeout|timed out|temporar|overload|rate|gateway|fetch failed|connection|reset|socket/i.test(message);
+}
+
+function isRetryableFetchError(error) {
+  const message = `${error?.name || ""} ${error?.code || ""} ${error?.message || ""} ${error?.cause?.code || ""} ${error?.cause?.message || ""}`;
+  return /AbortError|Timeout|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket|network|terminated/i.test(message);
+}
+
+function upstreamFetchErrorResult(error, model, attempt, attempts) {
+  const isTimeout = error?.name === "AbortError";
+  const message = `${isTimeout ? "upstream_timeout" : "upstream_fetch_failed"} after ${attempt}/${attempts} attempt(s): ${error?.message || String(error)}`;
+  return {
+    ok: false,
+    status: isTimeout ? 504 : 502,
+    payload: {
+      error: {
+        type: isTimeout ? "upstream_timeout" : "upstream_fetch_error",
+        message,
+        code: error?.code || error?.cause?.code || undefined,
+      },
+    },
+    raw: message,
+    model,
+    attempt,
+    attempts,
+  };
 }
 
 async function callUpstreamWithFallback(body, context = {}) {
   const tools = context.tools || [];
   const firstRaw = await callUpstreamChat(body);
-  const first = firstRaw.ok ? await retryToolDenialOnce(firstRaw, body, tools) : firstRaw;
+  const first = firstRaw.ok ? await retryToolComplianceOnce(firstRaw, body, tools) : firstRaw;
   if (first.ok || body.model === FALLBACK_MODEL) {
     return first;
   }
   if (shouldFallbackToFallbackModel(first, body.model)) {
     const fallbackRaw = await callUpstreamChat(body, FALLBACK_MODEL);
-    const fallback = fallbackRaw.ok ? await retryToolDenialOnce(fallbackRaw, body, tools, FALLBACK_MODEL) : fallbackRaw;
+    const fallback = fallbackRaw.ok ? await retryToolComplianceOnce(fallbackRaw, body, tools, FALLBACK_MODEL) : fallbackRaw;
     if (fallback.ok) {
       return fallback;
     }
@@ -444,25 +519,75 @@ function shouldFallbackToFallbackModel(upstream, requestedModel) {
   if (upstream?.status === 400 && /model|unsupported|not supported|Instructions are required/i.test(message)) {
     return true;
   }
-  if ([502, 503, 504].includes(upstream?.status) && /model|provider|key|available|temporar|overload|server/i.test(message)) {
+  if ([500, 502, 503, 504].includes(upstream?.status) && /model|provider|key|available|temporar|overload|server|gateway|fetch failed|timeout|connection|reset|socket|network/i.test(message)) {
     return true;
   }
   return false;
 }
 
-async function retryToolDenialOnce(upstream, body, tools = [], modelOverride = null) {
+async function retryToolComplianceOnce(upstream, body, tools = [], modelOverride = null) {
+  let current = upstream;
+  for (let attempt = 1; attempt <= TOOL_COMPLIANCE_RETRIES; attempt += 1) {
+    const before = current;
+    if (shouldRetryToolDenial(current, tools)) {
+      current = await retryToolDenialOnce(current, body, tools, modelOverride, attempt);
+    }
+    if (shouldRetryPlanningOnly(current, tools)) {
+      current = await retryPlanningOnlyOnce(current, body, tools, modelOverride, attempt);
+    }
+    if (current === before || (!shouldRetryToolDenial(current, tools) && !shouldRetryPlanningOnly(current, tools))) {
+      break;
+    }
+  }
+  if (shouldRetryPlanningOnly(current, tools) && isMalformedToolProtocolText(openAIMessageText(upstreamAssistantMessage(current)))) {
+    return quarantineMalformedToolProtocol(current);
+  }
+  return current;
+}
+
+async function retryToolDenialOnce(upstream, body, tools = [], modelOverride = null, attempt = 1) {
   if (!shouldRetryToolDenial(upstream, tools)) {
     return upstream;
   }
 
   const retryBody = withToolDenialCorrection(body, tools, upstream);
   await trace("tool_denial_retry", {
+    attempt,
     model: modelOverride || body?.model,
     available_tools: toolNames(tools),
     denial_preview: truncate(openAIMessageText(upstreamAssistantMessage(upstream)), 500),
   });
   const retry = await callUpstreamChat(retryBody, modelOverride);
   return retry.ok ? { ...retry, bridge_retry: "tool_denial" } : upstream;
+}
+
+async function retryPlanningOnlyOnce(upstream, body, tools = [], modelOverride = null, attempt = 1) {
+  if (!shouldRetryPlanningOnly(upstream, tools)) {
+    return upstream;
+  }
+
+  const retryBody = withPlanningOnlyCorrection(body, tools, upstream);
+  await trace("planning_only_retry", {
+    attempt,
+    model: modelOverride || body?.model,
+    available_tools: toolNames(tools),
+    planning_preview: truncate(openAIMessageText(upstreamAssistantMessage(upstream)), 500),
+  });
+  const retry = await callUpstreamChat(retryBody, modelOverride);
+  return retry.ok ? { ...retry, bridge_retry: "planning_only" } : upstream;
+}
+
+function quarantineMalformedToolProtocol(upstream) {
+  const clone = JSON.parse(JSON.stringify(upstream));
+  const message = clone?.payload?.choices?.[0]?.message;
+  if (message) {
+    delete message.tool_calls;
+    message.content = "[bridge rejected malformed tool protocol after retry budget; no executable tool call was emitted]";
+  }
+  if (clone?.payload?.choices?.[0]) {
+    clone.payload.choices[0].finish_reason = "stop";
+  }
+  return { ...clone, bridge_retry: "malformed_tool_protocol_quarantined" };
 }
 
 function shouldRetryToolDenial(upstream, tools = []) {
@@ -475,6 +600,19 @@ function shouldRetryToolDenial(upstream, tools = []) {
     return false;
   }
   return isToolDenialText(openAIMessageText(message));
+}
+
+function shouldRetryPlanningOnly(upstream, tools = []) {
+  if (!upstream?.ok || !hasFileOrShellTools(tools)) {
+    return false;
+  }
+
+  const message = upstreamAssistantMessage(upstream);
+  if (upstreamMessageHasToolCall(message, tools)) {
+    return false;
+  }
+  const text = openAIMessageText(message);
+  return isMalformedToolProtocolText(text) || isPlanningOnlyText(text);
 }
 
 function upstreamAssistantMessage(upstream) {
@@ -524,6 +662,45 @@ function isToolDenialText(text) {
   return [...englishPatterns, ...chinesePatterns].some((pattern) => pattern.test(normalized));
 }
 
+function isPlanningOnlyText(text) {
+  if (!text || typeof text !== "string") {
+    return false;
+  }
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized || normalized.length > 1800) {
+    return false;
+  }
+
+  const startsLikePlan =
+    /^(?:i(?:'|’)?ll|i will|i(?:'|’)?m going to|let me|i need to|i should|i can|next,? i(?:'|’)?ll)\b/i.test(normalized) ||
+    /^(?:我会|我将|我先|接下来我|先看|先检查|先运行|先写|先创建)/.test(normalized);
+  if (!startsLikePlan) {
+    return false;
+  }
+
+  const hostWork =
+    /\b(?:inspect|check|read|open|search|grep|list|run|execute|create|write|edit|update|modify|patch|test|verify|compile|generate|save)\b/i.test(normalized) ||
+    /(?:检查|读取|查看|搜索|运行|执行|创建|写入|修改|更新|测试|验证|编译|生成|保存)/.test(normalized);
+  if (!hostWork) {
+    return false;
+  }
+
+  const finalMarkers =
+    /\b(?:completed|done|finished|created|updated|verified|result|results|summary|pass|failed)\b/i.test(normalized) ||
+    /(?:完成|已经|结果|产物|通过|失败)/.test(normalized);
+  return !finalMarkers;
+}
+
+function isMalformedToolProtocolText(text) {
+  if (!text || typeof text !== "string") {
+    return false;
+  }
+  if (!/<\/?(?:tool_call|tool_calls|tool_use|invoke|tool_call_name)\b/i.test(text)) {
+    return false;
+  }
+  return extractToolCallsFromText(text, []).length === 0;
+}
+
 function withToolDenialCorrection(body, tools = [], upstream = {}) {
   const priorText = openAIMessageText(upstreamAssistantMessage(upstream));
   const messages = [...(body?.messages || [])];
@@ -531,6 +708,16 @@ function withToolDenialCorrection(body, tools = [], upstream = {}) {
     messages.push({ role: "assistant", content: priorText });
   }
   messages.push({ role: "user", content: buildToolDenialCorrection(tools) });
+  return { ...body, messages };
+}
+
+function withPlanningOnlyCorrection(body, tools = [], upstream = {}) {
+  const priorText = openAIMessageText(upstreamAssistantMessage(upstream));
+  const messages = [...(body?.messages || [])];
+  if (priorText) {
+    messages.push({ role: "assistant", content: priorText });
+  }
+  messages.push({ role: "user", content: buildPlanningOnlyCorrection(tools) });
   return { ...body, messages };
 }
 
@@ -554,6 +741,28 @@ function buildToolDenialCorrection(tools = []) {
   ].filter(Boolean).join("\n");
 }
 
+function buildPlanningOnlyCorrection(tools = []) {
+  const names = toolNames(tools);
+  const examples = [];
+  if (names.includes("Bash")) {
+    examples.push("<tool_call>{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\",\"description\":\"Inspect the project root\"}}</tool_call>");
+  }
+  if (names.includes("Write")) {
+    examples.push("<tool_call>{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/absolute/path/to/file\",\"content\":\"...\"}}</tool_call>");
+  }
+
+  return [
+    "<bridge_tool_correction>",
+    "Your previous response only described a future plan or emitted malformed/incomplete tool XML that could not be executed.",
+    `Host tools ARE available in this Claude Code session: ${names.join(", ")}.`,
+    "Do not say what you will do next. Emit exactly one needed <tool_call>{...}</tool_call> now, with no prose before or after it.",
+    "The tag body must be one valid JSON object with name and arguments. Do not emit nested XML tags, half-open tags, attribute-only wrappers, or bare <tool_call> text.",
+    "If you need to plan, write the plan via the Write tool. If you need to inspect, use Read/Grep/LS/Bash.",
+    examples.length ? `Use this protocol, for example: ${examples.join(" ")}` : "",
+    "</bridge_tool_correction>",
+  ].filter(Boolean).join("\n");
+}
+
 function parseJsonSafe(value) {
   if (value == null) {
     return {};
@@ -565,12 +774,16 @@ function parseJsonSafe(value) {
     return { value };
   }
   const cleaned = stripCodeFence(value.trim());
-  for (const candidate of [cleaned, firstBalancedJson(cleaned)].filter(Boolean)) {
+  for (const candidate of [cleaned, firstBalancedJson(cleaned), repairTriviallyUnbalancedJson(cleaned)].filter(Boolean)) {
     try {
       return JSON.parse(candidate);
     } catch {
       // Try the next candidate.
     }
+  }
+  const repairedToolJson = repairMalformedToolJson(cleaned);
+  if (repairedToolJson) {
+    return repairedToolJson;
   }
   return { raw: value };
 }
@@ -618,6 +831,79 @@ function firstBalancedJson(value) {
   return "";
 }
 
+function repairTriviallyUnbalancedJson(value) {
+  const trimmed = String(value || "").trim();
+  const start = trimmed.search(/[\[{]/);
+  if (start !== 0) {
+    return "";
+  }
+
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  for (const ch of trimmed) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+    } else if (ch === "{") {
+      stack.push("}");
+    } else if (ch === "[") {
+      stack.push("]");
+    } else if (ch === "}" || ch === "]") {
+      if (stack.pop() !== ch) {
+        return "";
+      }
+    }
+  }
+
+  if (inString || stack.length < 1 || stack.length > 3) {
+    return "";
+  }
+  return `${trimmed}${[...stack].reverse().join("")}`;
+}
+
+function repairMalformedToolJson(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed.startsWith("{") || !/"arguments"\s*:/.test(trimmed)) {
+    return null;
+  }
+
+  const id = trimmed.match(/"id"\s*:\s*"([^"]+)"/)?.[1];
+  const name = trimmed.match(/"name"\s*:\s*"([^"]+)"/)?.[1] || trimmed.match(/"tool_name"\s*:\s*"([^"]+)"/)?.[1];
+  const commaNameMatch = trimmed.match(/^\{\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*([\s\S]*)\}\s*$/);
+  if (!name && commaNameMatch) {
+    return {
+      ...(id ? { id } : {}),
+      name: commaNameMatch[1],
+      arguments: parseJsonSafe(commaNameMatch[2]),
+    };
+  }
+  const commandMatch =
+    trimmed.match(/"arguments"\s*:\s*"command"\s*:\s*"([\s\S]*)"\s*,\s*"description"\s*:\s*"([^"]*)"\s*\}\s*\}?$/) ||
+    trimmed.match(/"arguments"\s*:\s*\{\s*"command"\s*:\s*"([\s\S]*)"\s*,\s*"description"\s*:\s*"([^"]*)"\s*\}\s*\}?$/);
+  if (!name || !commandMatch) {
+    return null;
+  }
+
+  return {
+    ...(id ? { id } : {}),
+    name,
+    arguments: {
+      command: commandMatch[1],
+      description: commandMatch[2],
+    },
+  };
+}
+
 function parseXmlAttrs(attrText = "") {
   const attrs = {};
   const regexp = /([A-Za-z_:-][\w:.-]*)\s*=\s*"([^"]*)"/g;
@@ -648,6 +934,11 @@ function normalizeToolCalls(value, attrs = {}, toolMap = new Map()) {
     return parsed.calls.flatMap((entry) => normalizeToolCalls(entry, attrs, toolMap));
   }
 
+  const keyedCall = singleKeyedToolCall(parsed, toolMap);
+  if (keyedCall) {
+    return normalizeToolCalls({ name: keyedCall.name, arguments: keyedCall.input }, attrs, toolMap);
+  }
+
   let name =
     attrs.name ||
     parsed?.name ||
@@ -667,7 +958,13 @@ function normalizeToolCalls(value, attrs = {}, toolMap = new Map()) {
   if (!name && attrs.tool) {
     name = attrs.tool;
   }
+  if (!name && parsed && typeof parsed === "object") {
+    name = inferToolNameFromInput(parsed, toolMap);
+  }
   if (input == null && attrs.name && parsed && typeof parsed === "object") {
+    input = parsed;
+  }
+  if (input == null && name && parsed && typeof parsed === "object") {
     input = parsed;
   }
   input = parseJsonSafe(input ?? {});
@@ -676,14 +973,92 @@ function normalizeToolCalls(value, attrs = {}, toolMap = new Map()) {
     return [];
   }
 
-  const exactName = toolMap.get(name.toLowerCase()) || name;
+  const exactName = canonicalToolName(name, toolMap);
   return [
     {
-      id: parsed?.id || parsed?.tool_call_id || `toolu_${randomUUID().replaceAll("-", "")}`,
+      id: parsed?.id || parsed?.tool_call_id || attrs.id || `toolu_${randomUUID().replaceAll("-", "")}`,
       name: exactName,
       input: repairToolInput(exactName, input),
     },
   ];
+}
+
+function singleKeyedToolCall(parsed, toolMap = new Map()) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const keys = Object.keys(parsed);
+  if (keys.length !== 1) {
+    return null;
+  }
+  const [key] = keys;
+  const canonical = canonicalToolName(key, toolMap);
+  if (!toolMap.has(canonical.toLowerCase())) {
+    return null;
+  }
+  return { name: canonical, input: parsed[key] };
+}
+
+function canonicalToolName(name, toolMap = new Map()) {
+  const raw = String(name || "");
+  const direct = toolMap.get(raw.toLowerCase());
+  if (direct) {
+    return direct;
+  }
+  const normalized = raw.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  const aliases = {
+    bash: "Bash",
+    shell: "Bash",
+    run_shell: "Bash",
+    run_shell_command: "Bash",
+    execute_command: "Bash",
+    read: "Read",
+    read_file: "Read",
+    file_read: "Read",
+    view_file: "Read",
+    write: "Write",
+    write_file: "Write",
+    file_write: "Write",
+    edit: "Edit",
+    edit_file: "Edit",
+    replace_file: "Edit",
+    glob: "Glob",
+    find_files: "Glob",
+    grep: "Grep",
+    search: "Grep",
+    search_files: "Grep",
+    ls: "LS",
+    list_dir: "LS",
+    list_directory: "LS",
+  };
+  const alias = aliases[normalized];
+  if (alias && toolMap.has(alias.toLowerCase())) {
+    return toolMap.get(alias.toLowerCase());
+  }
+  return raw;
+}
+
+function inferToolNameFromInput(input, toolMap = new Map()) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return "";
+  }
+  const has = (name) => toolMap.has(name.toLowerCase()) ? toolMap.get(name.toLowerCase()) : "";
+  if (input.command || input.cmd || input.shell || input.bash) {
+    return has("Bash");
+  }
+  if (input.file_path || input.file || input.path) {
+    if ((input.content || input.data || input.text) && has("Write")) {
+      return has("Write");
+    }
+    if ((input.old_string || input.new_string || input.old || input.new || input.search || input.replace) && has("Edit")) {
+      return has("Edit");
+    }
+    return has("Read") || has("LS");
+  }
+  if (input.pattern || input.query) {
+    return has("Grep") || has("Glob");
+  }
+  return "";
 }
 
 function repairToolInput(name, input) {
@@ -728,11 +1103,24 @@ function summarizeCommand(command) {
 
 function extractTaggedToolCalls(text, toolMap) {
   const calls = [];
-  const tagRegexp = /<tool_call\b([^>]*)>([\s\S]*?)<\/tool_call>/gi;
+  const tagRegexp = /<tool_calls?\b([^>]*)>([\s\S]*?)<\/tool_calls?>/gi;
   let match;
   while ((match = tagRegexp.exec(text))) {
     const attrs = parseXmlAttrs(match[1] || "");
     let body = match[2].trim();
+    if (/<tool_calls?\b/i.test(body)) {
+      const nestedCalls = [...extractTaggedToolCalls(body, toolMap), ...extractLooseTaggedToolCalls(body, toolMap)];
+      if (nestedCalls.length) {
+        calls.push(...nestedCalls);
+        continue;
+      }
+    }
+    const xmlInput = parseXmlToolInput(body);
+    if (Object.keys(xmlInput).length) {
+      const nameFromBody = inferToolNameFromXmlBody(body);
+      calls.push(...normalizeToolCalls(xmlInput, { ...attrs, name: attrs.name || attrs.tool || nameFromBody }, toolMap));
+      continue;
+    }
     const argumentMatch = body.match(/<tool_call_arguments\b[^>]*>([\s\S]*?)<\/tool_call_arguments>/i);
     if (argumentMatch) {
       const name = attrs.name || attrs.tool;
@@ -743,14 +1131,141 @@ function extractTaggedToolCalls(text, toolMap) {
   return calls;
 }
 
+function parseXmlToolInput(body = "") {
+  const input = {};
+  const argumentsMatch = body.match(/<arguments\b[^>]*>([\s\S]*?)<\/arguments>/i);
+  if (argumentsMatch) {
+    const rawArguments = unescapeXmlText(argumentsMatch[1].trim());
+    const parsedArguments = parseJsonSafe(rawArguments);
+    if (parsedArguments && typeof parsedArguments === "object" && !Array.isArray(parsedArguments)) {
+      Object.assign(input, parsedArguments);
+    } else {
+      const xmlArguments = parseXmlToolInput(rawArguments);
+      if (Object.keys(xmlArguments).length) {
+        Object.assign(input, xmlArguments);
+      }
+    }
+  }
+
+  for (const tagName of ["parameter", "arg", "argument", "tool_argument"]) {
+    const regexp = new RegExp(`<${tagName}\\b([^>]*)>([\\s\\S]*?)<\\/${tagName}>`, "gi");
+    let match;
+    while ((match = regexp.exec(body))) {
+      const attrs = parseXmlAttrs(match[1] || "");
+      const name = attrs.name || attrs.key;
+      if (!name) {
+        continue;
+      }
+      input[name] = coerceXmlToolValue(unescapeXmlText(match[2].trim()), attrs);
+      if (name === "command" && attrs.description && input.description == null) {
+        input.description = attrs.description;
+      }
+    }
+
+    const selfClosingRegexp = new RegExp(`<${tagName}\\b([^>]*)\\/>`, "gi");
+    while ((match = selfClosingRegexp.exec(body))) {
+      const attrs = parseXmlAttrs(match[1] || "");
+      const name = attrs.name || attrs.key;
+      if (!name || attrs.value == null) {
+        continue;
+      }
+      input[name] = coerceXmlToolValue(attrs.value, attrs);
+      if (name === "command" && attrs.description && input.description == null) {
+        input.description = attrs.description;
+      }
+    }
+  }
+
+  for (const name of ["command", "description", "file_path", "path", "content", "old_string", "new_string", "pattern", "glob", "limit"]) {
+    if (input[name] != null) {
+      continue;
+    }
+    const regexp = new RegExp(`<${name}\\b([^>]*)>([\\s\\S]*?)<\\/${name}>`, "i");
+    const match = body.match(regexp);
+    if (!match) {
+      continue;
+    }
+    const attrs = parseXmlAttrs(match[1] || "");
+    input[name] = coerceXmlToolValue(unescapeXmlText(match[2].trim()), attrs);
+  }
+  return input;
+}
+
+function inferToolNameFromXmlBody(body = "") {
+  for (const tagName of ["tool_name", "name"]) {
+    const toolNameMatch = body.match(new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "i"));
+    if (toolNameMatch) {
+      return unescapeXmlText(toolNameMatch[1].trim());
+    }
+  }
+  const idMatch = body.match(/<id(?:="[^"]*")?>([\s\S]*?)<\/id>/i);
+  if (idMatch) {
+    return unescapeXmlText(idMatch[1].trim());
+  }
+  return "";
+}
+
+function unescapeXmlText(value) {
+  return String(value)
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function coerceXmlToolValue(value, attrs = {}) {
+  if (attrs.string === "false") {
+    if (/^-?\d+$/.test(value)) {
+      return Number.parseInt(value, 10);
+    }
+    if (/^-?\d+\.\d+$/.test(value)) {
+      return Number.parseFloat(value);
+    }
+    if (value === "true" || value === "false") {
+      return value === "true";
+    }
+  }
+  return value;
+}
+
 function extractLooseTaggedToolCalls(text, toolMap) {
-  const match = text.match(/<tool_call\b([^>]*)>([\s\S]*)$/i);
+  const match = text.match(/<tool_calls?\b([^>]*)>([\s\S]*)$/i);
   if (!match) {
     return [];
   }
   const attrs = parseXmlAttrs(match[1] || "");
-  const body = (firstBalancedJson(match[2].trim()) || match[2].trim()).trim();
+  const rawBody = match[2].trim();
+  const xmlInput = parseXmlToolInput(rawBody);
+  if (Object.keys(xmlInput).length) {
+    return normalizeToolCalls(xmlInput, { ...attrs, name: attrs.name || attrs.tool || inferToolNameFromXmlBody(rawBody) }, toolMap);
+  }
+  const body = (firstBalancedJson(rawBody) || rawBody).trim();
   return normalizeToolCalls(body, attrs, toolMap);
+}
+
+function extractMalformedToolCallsAttrs(text, toolMap) {
+  if (!/<tool_calls?\b/i.test(text)) {
+    return [];
+  }
+  const id = text.match(/<tool_calls?\b[^>]*\bid="([^"]+)"/i)?.[1];
+  const name = text.match(/<tool_calls?\b[^>]*\bname="([^"]+)"/i)?.[1] || inferToolNameFromXmlBody(text);
+  const argsMatch = text.match(/<tool_calls?\b[^>]*\barguments="([\s\S]*?)(?=<\/tool_calls?>)/i);
+  if (!name || !argsMatch) {
+    return [];
+  }
+  const args = argsMatch[1].trim();
+  return normalizeToolCalls(parseJsonSafe(args), { id, name }, toolMap);
+}
+
+function extractInvokeToolCalls(text, toolMap) {
+  const calls = [];
+  const tagRegexp = /<invoke\b([^>]*)>([\s\S]*?)<\/invoke>/gi;
+  let match;
+  while ((match = tagRegexp.exec(text))) {
+    const attrs = parseXmlAttrs(match[1] || "");
+    const input = parseXmlToolInput(match[2] || "");
+    calls.push(...normalizeToolCalls(input, attrs, toolMap));
+  }
+  return calls;
 }
 
 function parseToolUseAttrs(attrText = "") {
@@ -804,6 +1319,10 @@ function extractToolCallsFromText(text, tools = []) {
     return [];
   }
   const toolMap = new Map((tools || []).filter((tool) => tool?.name).map((tool) => [tool.name.toLowerCase(), tool.name]));
+  const malformedTagged = extractMalformedToolCallsAttrs(text, toolMap);
+  if (malformedTagged.length) {
+    return malformedTagged;
+  }
   const tagged = extractTaggedToolCalls(text, toolMap);
   if (tagged.length) {
     return tagged;
@@ -815,6 +1334,10 @@ function extractToolCallsFromText(text, tools = []) {
   const anthropicTagged = extractAnthropicToolUseCalls(text, toolMap);
   if (anthropicTagged.length) {
     return anthropicTagged;
+  }
+  const invokeTagged = extractInvokeToolCalls(text, toolMap);
+  if (invokeTagged.length) {
+    return invokeTagged;
   }
   return extractJsonToolCalls(text, toolMap);
 }
@@ -833,7 +1356,7 @@ function anthropicBlocksFromOpenAIMessage(message = {}, tools = []) {
     return blocks;
   }
 
-  const content = typeof message.content === "string" ? message.content : "";
+  const content = openAIMessageText(message);
   const parsedToolCalls = extractToolCallsFromText(content, tools);
   if (parsedToolCalls.length) {
     return parsedToolCalls.map((call) => ({
@@ -1021,7 +1544,7 @@ function createServer() {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || `${HOST}:${PORT}`}`);
 
-    if (req.method === "GET" && url.pathname === "/healthz") {
+    if (req.method === "GET" && (url.pathname === "/healthz" || url.pathname === "/health")) {
       const config = await readUpstreamConfig();
       json(res, 200, {
         ok: true,
@@ -1086,10 +1609,13 @@ export {
   extractToolCallsFromText,
   flattenAnthropicMessages,
   isToolDenialText,
+  isPlanningOnlyText,
   parseJsonSafe,
   repairToolInput,
+  shouldRetryPlanningOnly,
   shouldRetryToolDenial,
   shouldFallbackToFallbackModel,
   toOpenAIChatRequest,
+  withPlanningOnlyCorrection,
   withToolDenialCorrection,
 };
